@@ -111,6 +111,17 @@ resource "aws_s3_bucket_policy" "state" {
   depends_on = [aws_s3_bucket_public_access_block.state]
 }
 
+# --- account-wide S3 Block Public Access ---------------------------------------------------
+# Guardrail from exercise C3: even if a bucket's own settings are switched off by mistake, no
+# bucket in this account can be made public (S3 rejects public policies and ignores public ACLs).
+resource "aws_s3_account_public_access_block" "this" {
+  account_id              = var.account_id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
 # --- GitHub OIDC ----------------------------------------------------------------------------
 
 resource "aws_iam_openid_connect_provider" "github" {

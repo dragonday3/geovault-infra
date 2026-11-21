@@ -34,9 +34,9 @@ jobs:
         run: docker compose run --rm --no-deps terraform fmt -recursive -check -diff
       - name: terraform validate (every root)
         run: |
-          for env in local aws aws-bootstrap; do
-            docker compose run --rm tf-init -chdir=envs/$env init -backend=false -input=false
-            docker compose run --rm --no-deps terraform -chdir=envs/$env validate
+          for root in envs/local envs/aws envs/aws-bootstrap exercises/public-bucket; do
+            docker compose run --rm tf-init -chdir=$root init -backend=false -input=false
+            docker compose run --rm --no-deps terraform -chdir=$root validate
           done
       - name: Checkov
         run: docker compose run --rm checkov
@@ -69,6 +69,23 @@ jobs:
       - name: terraform destroy
         if: always()
         run: docker compose run --rm terraform -chdir=envs/local destroy -auto-approve -input=false
+
+  exercise:
+    # C3: the public-bucket exercise on the emulator; fails if detection, fix or prevention breaks.
+    runs-on: ubuntu-24.04
+    needs: static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start MiniStack
+        run: docker compose up -d --wait ministack
+      - name: Build scanner
+        run: docker compose build scan
+      - name: terraform init (online, providers only)
+        run: docker compose run --rm tf-init -chdir=exercises/public-bucket init -input=false
+      - name: Run exercise C3 (vulnerable, detect, fix, prevent)
+        run: sh terraform/exercises/public-bucket/run.sh
 
   plan-aws:
     # main only: pull requests never receive AWS credentials (they run on the emulator above).

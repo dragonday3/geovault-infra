@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Milestone C3: public-bucket misconfiguration exercise (2026-11-21)
+
+- `terraform/exercises/public-bucket`: a deliberately public "partner export" bucket in a
+  sandbox emulator account (111111111111) with synthetic data. Three phases:
+  - `phase=vulnerable`: the mistake.
+  - `phase=fixed`: private, SSE-KMS, versioned, TLS only.
+  - `guardrail=true`: account-level Block Public Access.
+  The local-emulator-only guard is the same as `envs/local`.
+- `verify/scan_public.py` (compose service `scan`): an account-wide, Prowler-style S3 exposure
+  scan. It checks account and bucket Block Public Access, public policies and ACLs, TLS-only,
+  KMS and versioning, and makes an anonymous `GET` to prove real exposure.
+- `run.sh` runs every phase and asserts each outcome:
+  - a static Checkov scan of the resolved plans;
+  - detection, including a successful anonymous download;
+  - the fix (403);
+  - prevention: S3 rejects the repeated mistake under the account guardrail.
+  CI job `exercise` runs it on every push.
+- **Stack gap found and fixed:** `aws_s3_account_public_access_block` is added to the bootstrap,
+  and the verifier checks it (68 checks).
+- Lessons recorded in `docs/exercises/c3-public-bucket.md`:
+  - Source scanning missed the public policy and gave false positives on the fix.
+  - Values computed at apply are invisible to plan scans.
+  - Plans of a change embed the old state.
+- The main Checkov gate skips `exercises/`, which is insecure on purpose and has its own CI
+  assertions.
+
 ### Milestone C2: CI bootstrap with GitHub OIDC (2026-11-21)
 
 - `modules/bootstrap`:

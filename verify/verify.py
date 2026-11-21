@@ -59,6 +59,12 @@ if key_id:
     rot = kms.get_key_rotation_status(KeyId=key_id)["KeyRotationEnabled"]
     check("KMS", "automatic key rotation on", rot, str(rot))
 
+# --- account guardrail --------------------------------------------------------------------
+s3control = session.client("s3control", config=CONFIG)
+acct = safe(lambda: s3control.get_public_access_block(AccountId=account)["PublicAccessBlockConfiguration"], {})
+check("Account", "account-level S3 Block Public Access on (all four)",
+      isinstance(acct, dict) and len(acct) == 4 and all(acct.values()), json.dumps(acct) if isinstance(acct, dict) else str(acct))
+
 # --- S3 -------------------------------------------------------------------------------------
 for kind in ("photos", "logs"):
     bucket = f"{NAME}-{kind}-{account}"

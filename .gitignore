@@ -40,3 +40,5 @@ CLAUDE.md
 CLAUDE.local.md
 .claude/
 docs/plan.md
+# Exercise inputs (no secrets)
+!terraform/exercises/**/*.tfvars
