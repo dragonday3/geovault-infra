@@ -1,0 +1,66 @@
+# CI: static checks, then the whole stack applied to the MiniStack emulator and verified.
+# No AWS credentials exist in this workflow: nothing in it can touch a real account.
+# Third-party actions are pinned to full commit SHAs; images are pinned by digest in compose.yml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_IMAGE: zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f  # v8.30.1
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: terraform fmt
+        run: docker compose run --rm --no-deps terraform fmt -recursive -check -diff
+      - name: terraform validate (local and aws)
+        run: |
+          for env in local aws; do
+            docker compose run --rm tf-init -chdir=envs/$env init -backend=false -input=false
+            docker compose run --rm --no-deps terraform -chdir=envs/$env validate
+          done
+      - name: Checkov
+        run: docker compose run --rm checkov
+
+  secrets:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Gitleaks
+        run: docker run --rm -v "$PWD:/repo" "$GITLEAKS_IMAGE" git /repo --redact --no-banner --verbose
+
+  emulator:
+    runs-on: ubuntu-24.04
+    needs: static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start MiniStack
+        run: docker compose up -d --wait ministack
+      - name: terraform init (online, providers only)
+        run: docker compose run --rm tf-init -chdir=envs/local init -input=false
+      - name: terraform apply (offline, emulator only)
+        run: docker compose run --rm terraform -chdir=envs/local apply -auto-approve -input=false
+      - name: Verify security baseline
+        run: docker compose run --rm --build verify
+      - name: terraform destroy
+        if: always()
+        run: docker compose run --rm terraform -chdir=envs/local destroy -auto-approve -input=false

@@ -1,0 +1,93 @@
+# Local AWS: MiniStack (MIT, no account needed) emulates the AWS APIs on 127.0.0.1:4566.
+# Tool containers (profile "tools") pin Terraform, Checkov and the verifier, so nothing is
+# installed on the host and every run uses the same versions as CI.
+#
+#   docker compose up -d ministack
+#   docker compose run --rm tf-init -chdir=envs/local init      # online: downloads providers
+#   docker compose run --rm terraform -chdir=envs/local apply   # offline: emulator only
+#   docker compose run --rm verify
+#
+# Nothing here can reach real AWS:
+#   - terraform and verify sit on an internal Docker network with NO internet route, so even
+#     an endpoint the provider config forgot cannot leave the machine;
+#   - credentials are the dummy pair test/test;
+#   - the local provider only accepts account 000000000000 (asked of the emulated STS).
+# Only tf-init has internet, and it only runs `terraform init` (provider downloads).
+name: geovault-infra
+
+services:
+  ministack:
+    image: ministackorg/ministack:1.5.43@sha256:4cc0701953855c59e1a18fa289888f0b7f2d99afe1417c3cc3b7fe43c373c771
+    ports:
+      - "127.0.0.1:4566:4566"  # loopback only
+    networks:
+      default: {}
+      emu:
+        # S3 Control prefixes the account id to the host name (<account>.<endpoint>).
+        aliases: ["000000000000.ministack"]
+    environment:
+      MINISTACK_REGION: ap-south-1
+      MINISTACK_ACCOUNT_ID: "000000000000"
+      CLOUDTRAIL_RECORDING: "1"  # record API calls so the audit trail can be inspected
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4566/_ministack/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  tf-init:
+    profiles: [tools]
+    image: hashicorp/terraform:1.17.2@sha256:6e9c1e647c31a960dc9b59e13272f9111d90010c10b717f77ffb324767660475
+    working_dir: /work/terraform
+    volumes:
+      - .:/work
+      - tf-plugin-cache:/plugin-cache
+    environment:
+      TF_PLUGIN_CACHE_DIR: /plugin-cache
+      TF_IN_AUTOMATION: "1"
+    entrypoint: ["/bin/sh", "-c", "case \" $$* \" in *' init'*) exec terraform \"$$@\";; *) echo 'tf-init only runs terraform init' >&2; exit 2;; esac", "tf-init"]
+
+  terraform:
+    profiles: [tools]
+    image: hashicorp/terraform:1.17.2@sha256:6e9c1e647c31a960dc9b59e13272f9111d90010c10b717f77ffb324767660475
+    networks: [emu]  # no internet
+    working_dir: /work/terraform
+    volumes:
+      - .:/work
+      - tf-plugin-cache:/plugin-cache
+    environment:
+      TF_PLUGIN_CACHE_DIR: /plugin-cache
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_endpoint: http://ministack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      ministack:
+        condition: service_healthy
+
+  checkov:
+    profiles: [tools]
+    image: bridgecrew/checkov:3.4.6@sha256:b4b7e9d419ddb9ae7a257678ee39cb5d9e5569f604723297dd9cec7fd4571bff
+    volumes:
+      - .:/work:ro
+    command: ["--directory", "/work/terraform", "--framework", "terraform", "--compact", "--quiet", "--download-external-modules", "false"]
+
+  verify:
+    profiles: [tools]
+    build: ./verify
+    networks: [emu]  # no internet
+    environment:
+      AWS_ENDPOINT_URL: http://ministack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: ap-south-1
+    depends_on:
+      ministack:
+        condition: service_healthy
+
+networks:
+  emu:
+    internal: true  # no route out of the host
+
+volumes:
+  tf-plugin-cache:
