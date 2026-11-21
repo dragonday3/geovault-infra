@@ -186,6 +186,96 @@ check("Cost", "monthly budget exists", isinstance(b, dict) and bool(b), f"{b.get
 n = safe(lambda: budgets.describe_notifications_for_budget(AccountId=account, BudgetName=f"{NAME}-monthly")["Notifications"], [])
 check("Cost", "budget alerts configured (50%, 100%, forecast)", isinstance(n, list) and len(n) >= 3, f"{len(n) if isinstance(n, list) else n} alerts")
 
+# --- CI bootstrap: state bucket and GitHub OIDC trust ------------------------------------
+REPO = os.environ.get("GITHUB_REPO", "dragonday3/geovault-infra")
+OIDC = "token.actions.githubusercontent.com"
+state = f"geovault-tfstate-{account}"
+if isinstance(safe(lambda: s3.head_bucket(Bucket=state)), Exception):
+    check("Bootstrap", "state bucket exists", False, state)
+else:
+    bpa = safe(lambda: s3.get_public_access_block(Bucket=state)["PublicAccessBlockConfiguration"], {})
+    check("Bootstrap", "state bucket: Block Public Access on", isinstance(bpa, dict) and len(bpa) == 4 and all(bpa.values()))
+    ver = safe(lambda: s3.get_bucket_versioning(Bucket=state).get("Status"), "")
+    check("Bootstrap", "state bucket: versioning on", ver == "Enabled", str(ver))
+    spol = safe(lambda: json.loads(s3.get_bucket_policy(Bucket=state)["Policy"]), {})
+    check("Bootstrap", "state bucket: policy denies non-TLS requests", any(
+        st.get("Effect") == "Deny" and st.get("Condition", {}).get("Bool", {}).get("aws:SecureTransport") in ("false", False, ["false"])
+        for st in (spol.get("Statement", []) if isinstance(spol, dict) else [])))
+    enc = safe(lambda: s3.get_bucket_encryption(Bucket=state)["ServerSideEncryptionConfiguration"]["Rules"][0], {})
+    check("Bootstrap", "state bucket: encrypted", bool(enc))
+
+providers = [p["Arn"] for p in iam.list_open_id_connect_providers()["OpenIDConnectProviderList"] if p["Arn"].endswith(OIDC)]
+check("Bootstrap", "GitHub OIDC provider exists", len(providers) == 1, providers[0] if providers else "missing")
+if providers:
+    aud = iam.get_open_id_connect_provider(OpenIDConnectProviderArn=providers[0]).get("ClientIDList", [])
+    check("Bootstrap", "OIDC audience is only sts.amazonaws.com", aud == ["sts.amazonaws.com"], str(aud))
+
+EXPECTED_SUB = {
+    "plan": {f"repo:{REPO}:ref:refs/heads/main"},  # never pull requests
+    "apply": {f"repo:{REPO}:environment:production"},
+}
+for kind, expected in EXPECTED_SUB.items():
+    role = safe(lambda k=kind: iam.get_role(RoleName=f"geovault-ci-{k}")["Role"], {})
+    if not isinstance(role, dict) or not role:
+        check("Bootstrap", f"{kind} role exists", False)
+        continue
+    trust = role["AssumeRolePolicyDocument"]
+    trust = json.loads(trust) if isinstance(trust, str) else trust
+    sts_ = trust.get("Statement", [])
+    ok_principal = all(st.get("Principal", {}).get("Federated", "").endswith(OIDC) for st in sts_) and sts_
+    check("Bootstrap", f"{kind} role: only GitHub OIDC may assume it", bool(ok_principal))
+    subs, auds, loose = set(), set(), False
+    for st in sts_:
+        for op, conds in st.get("Condition", {}).items():
+            for key, vals in conds.items():
+                vals = set(as_list(vals))
+                if key == f"{OIDC}:sub":
+                    subs |= vals
+                    loose |= op != "StringEquals" or any("*" in v for v in vals)
+                if key == f"{OIDC}:aud":
+                    auds |= vals
+    check("Bootstrap", f"{kind} role: audience pinned to sts.amazonaws.com", auds == {"sts.amazonaws.com"}, str(sorted(auds)))
+    check("Bootstrap", f"{kind} role: subject exactly as designed", subs == expected and not loose, str(sorted(subs)))
+plan_attached = [p["PolicyName"] for p in safe(lambda: iam.list_attached_role_policies(RoleName="geovault-ci-plan")["AttachedPolicies"], [])]
+check("Bootstrap", "plan role is read-only (ReadOnlyAccess only)", plan_attached == ["ReadOnlyAccess"], str(plan_attached))
+plan_doc = safe(lambda: iam.get_role_policy(RoleName="geovault-ci-plan", PolicyName="state-and-decrypt")["PolicyDocument"], {})
+plan_doc = json.loads(plan_doc) if isinstance(plan_doc, str) else plan_doc
+writes = [r for st in plan_doc.get("Statement", []) if any(a in ("s3:PutObject", "s3:DeleteObject") for a in as_list(st.get("Action", [])))
+          for r in as_list(st.get("Resource", []))]
+check("Bootstrap", "plan role writes only *.tflock lock files", writes and all(r.endswith("/*.tflock") for r in writes), str(writes))
+
+# --- apply role guard rails ---------------------------------------------------------------
+apply_attached = [p["PolicyName"] for p in safe(lambda: iam.list_attached_role_policies(RoleName="geovault-ci-apply")["AttachedPolicies"], [])]
+check("Bootstrap", "apply role managed policies exactly PowerUserAccess", apply_attached == ["PowerUserAccess"], str(apply_attached))
+boundary_arn = f"arn:aws:iam::{account}:policy/{NAME}-boundary"
+apply_doc = safe(lambda: iam.get_role_policy(RoleName="geovault-ci-apply", PolicyName="stack-iam-and-state")["PolicyDocument"], {})
+apply_doc = json.loads(apply_doc) if isinstance(apply_doc, str) else apply_doc
+apply_stmts = apply_doc.get("Statement", []) if isinstance(apply_doc, dict) else []
+RAISING = {"iam:CreateRole", "iam:PutRolePolicy", "iam:AttachRolePolicy", "iam:PutRolePermissionsBoundary"}
+unguarded = [
+    a for st in apply_stmts if st.get("Effect", "Allow") == "Allow"
+    for a in as_list(st.get("Action", [])) if a in RAISING or a in ("iam:*", "*")
+    if st.get("Condition", {}).get("StringEquals", {}).get("iam:PermissionsBoundary") != boundary_arn
+]
+check("Bootstrap", "apply role: role-raising IAM writes require the boundary", not unguarded, str(unguarded))
+denied = {a for st in apply_stmts if st.get("Effect") == "Deny" for a in as_list(st.get("Action", []))}
+check("Bootstrap", "apply role: denied state-bucket tampering and StopLogging",
+      {"s3:PutBucketPolicy", "s3:PutBucketVersioning", "s3:DeleteObjectVersion", "cloudtrail:StopLogging"} <= denied,
+      f"{len(denied)} denied actions")
+for role_name in (f"{NAME}-instance", f"{NAME}-vpc-flow-logs"):
+    pb = safe(lambda r=role_name: iam.get_role(RoleName=r)["Role"].get("PermissionsBoundary", {}).get("PermissionsBoundaryArn"), "")
+    check("IAM", f"{role_name}: permissions boundary attached", pb == boundary_arn, str(pb))
+
+# --- no extra policies on any project role ----------------------------------------------
+EXPECTED_INLINE = {
+    f"{NAME}-instance": ["geovault-app"],
+    "geovault-ci-plan": ["state-and-decrypt"],
+    "geovault-ci-apply": ["stack-iam-and-state"],
+}
+for role_name, expected in EXPECTED_INLINE.items():
+    names = safe(lambda r=role_name: sorted(iam.list_role_policies(RoleName=r)["PolicyNames"]), [])
+    check("IAM", f"{role_name}: inline policies exactly {expected}", names == expected, str(names))
+
 # --- report ---------------------------------------------------------------------------------
 width = max(len(c) for _, c, _, _ in results)
 area_w = max(len(a) for a, _, _, _ in results)

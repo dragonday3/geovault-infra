@@ -5,6 +5,7 @@
 #   - Session Manager (no SSH): the AWS-managed core policy
 
 variable "name" { type = string }
+variable "permissions_boundary" { type = string }
 variable "region" { type = string }
 variable "account_id" { type = string }
 variable "photos_bucket_arn" { type = string }
@@ -22,8 +23,9 @@ data "aws_iam_policy_document" "assume" {
 }
 
 resource "aws_iam_role" "instance" {
-  name               = "${var.name}-instance"
-  assume_role_policy = data.aws_iam_policy_document.assume.json
+  permissions_boundary = var.permissions_boundary
+  name                 = "${var.name}-instance"
+  assume_role_policy   = data.aws_iam_policy_document.assume.json
 }
 
 data "aws_iam_policy_document" "app" {
@@ -65,9 +67,16 @@ resource "aws_iam_role_policy" "app" {
   policy = data.aws_iam_policy_document.app.json
 }
 
-resource "aws_iam_role_policy_attachment" "ssm_core" {
-  role       = aws_iam_role.instance.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+# Exclusive: Terraform owns the complete policy set on the role; anything attached or added
+# by hand is removed on the next apply.
+resource "aws_iam_role_policy_attachments_exclusive" "instance" {
+  role_name   = aws_iam_role.instance.name
+  policy_arns = ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
+}
+
+resource "aws_iam_role_policies_exclusive" "instance" {
+  role_name    = aws_iam_role.instance.name
+  policy_names = [aws_iam_role_policy.app.name]
 }
 
 resource "aws_iam_instance_profile" "instance" {

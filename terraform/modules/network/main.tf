@@ -3,6 +3,7 @@
 # administration goes through SSM Session Manager.
 
 variable "name" { type = string }
+variable "permissions_boundary" { type = string }
 variable "cidr" { type = string }
 variable "az" { type = string }
 variable "kms_key_arn" { type = string }
@@ -117,8 +118,9 @@ data "aws_iam_policy_document" "flow_assume" {
 }
 
 resource "aws_iam_role" "flow" {
-  name               = "${var.name}-vpc-flow-logs"
-  assume_role_policy = data.aws_iam_policy_document.flow_assume.json
+  permissions_boundary = var.permissions_boundary
+  name                 = "${var.name}-vpc-flow-logs"
+  assume_role_policy   = data.aws_iam_policy_document.flow_assume.json
 }
 
 data "aws_iam_policy_document" "flow" {

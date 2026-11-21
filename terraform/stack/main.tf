@@ -35,8 +35,10 @@ variable "force_destroy_buckets" {
 }
 
 locals {
-  name       = "geovault-${var.env}"
-  param_path = "/geovault/${var.env}"
+  name = "geovault-${var.env}"
+  # Created by the bootstrap (modules/bootstrap); every stack role must carry it.
+  permissions_boundary = "arn:aws:iam::${var.account_id}:policy/geovault-${var.env}-boundary"
+  param_path           = "/geovault/${var.env}"
   # CERT-In directions: keep logs for at least 180 days, inside India (ap-south-1).
   log_days = 400
 }
@@ -55,6 +57,7 @@ module "network" {
   az                      = var.az
   kms_key_arn             = module.kms.key_arn
   flow_log_retention_days = local.log_days
+  permissions_boundary    = local.permissions_boundary
 }
 
 module "storage" {
@@ -67,13 +70,14 @@ module "storage" {
 }
 
 module "iam" {
-  source            = "../modules/iam"
-  name              = local.name
-  region            = var.region
-  account_id        = var.account_id
-  photos_bucket_arn = module.storage.photos_bucket_arn
-  kms_key_arn       = module.kms.key_arn
-  param_path        = local.param_path
+  source               = "../modules/iam"
+  name                 = local.name
+  region               = var.region
+  account_id           = var.account_id
+  photos_bucket_arn    = module.storage.photos_bucket_arn
+  kms_key_arn          = module.kms.key_arn
+  param_path           = local.param_path
+  permissions_boundary = local.permissions_boundary
 }
 
 module "secrets" {

@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+### Milestone C2: CI bootstrap with GitHub OIDC (2026-11-21)
+
+- `modules/bootstrap`:
+  - Terraform state bucket: versioned, SSE, all Block Public Access settings, ACLs disabled,
+    TLS-only policy, old versions expire after 90 days.
+  - GitHub Actions OIDC provider.
+  - Two CI roles whose trust uses `StringEquals` on audience and subject:
+    - `geovault-ci-plan` (main only): `ReadOnlyAccess`, writes only `*.tflock`, KMS decrypt only
+      through the `geovault-prod` alias and only via SSM.
+    - `geovault-ci-apply` (only the `production` environment, which has a required reviewer):
+      `PowerUserAccess`, plus IAM limited to `geovault-prod-*` and PassRole only to EC2 and VPC
+      flow logs.
+- `envs/aws-bootstrap`: a one-time root for the real account. Validated, not applied.
+- CI: `plan-aws`, `plan-for-apply` and `apply-aws` jobs. They are skipped until repository
+  variables exist. They use OIDC with `id-token: write` granted per job and a pinned
+  `configure-aws-credentials`. The `terraform-aws` compose service passes the OIDC
+  session through. Nothing is stored.
+- Verifier: new checks cover the OIDC audience and subject, the read-only plan role,
+  lock-only writes, and the exact inline policy set on every role.
+- Mutation-tested:
+  - A widened trust (`repo:dragonday3/*`), `AdministratorAccess` on the plan role and a
+    backdoor inline policy are each detected.
+  - Fixed: IAM policies are now owned exclusively (`aws_iam_role_policy_attachments_exclusive`,
+    `aws_iam_role_policies_exclusive`), so `apply` removes anything attached by hand. A plain
+    attachment let `AdministratorAccess` survive.
+  - Fixed: the verifier first missed an extra inline policy. It now compares the full list.
+- **Fresh-eyes review (critical finding, fixed before shipping):** `CreateRole`, `PutRolePolicy`
+  and `PowerUserAccess`'s `sts:AssumeRole` together let the apply role escalate to admin.
+  Fixes:
+  - `geovault-<env>-boundary` permissions boundary on every stack role. The apply role's
+    role-raising IAM writes now require it.
+  - Explicit denies: state-bucket tampering, `cloudtrail:StopLogging`, and edits to its own
+    roles, the boundary or the OIDC provider.
+- Other review fixes:
+  - Pull requests no longer get AWS credentials.
+  - The plan role's decrypt is limited to SSM, so it cannot read the photos.
+  - Deploying is split into plan-for-apply (published for review) and apply-aws (approval,
+    re-plan, then apply only if the changes hash matches).
+  - Pushes cannot cancel a running apply, and state access is serialized.
+  - Missing IAM actions added.
+- Verifier: 67 checks. New checks cover the boundary on stack roles, guarded role writes, the
+  deny statements, the state bucket TLS policy and the apply role's exact managed policies.
+  All were mutation-tested.
+- Checkov: 0 failed. actionlint: clean.
+
 ### Milestone C1: hardened stack, local emulator, verification (2026-11-21)
 
 - Terraform modules `kms`, `network`, `storage`, `iam`, `secrets`, `compute` and `audit`,

@@ -67,6 +67,23 @@ module "stack" {
   budget_limit_usd      = 20
   alert_email           = "alerts@example.com"
   force_destroy_buckets = true
+  depends_on            = [module.bootstrap] # creates the permissions boundary
+}
+
+module "bootstrap" {
+  source        = "../../modules/bootstrap"
+  account_id    = local.account_id
+  region        = local.region
+  github_repo   = "dragonday3/geovault-infra"
+  env           = "local"
+  force_destroy = true
 }
 
 output "summary" { value = module.stack.summary }
+output "bootstrap" {
+  value = {
+    state_bucket   = module.bootstrap.state_bucket
+    plan_role_arn  = module.bootstrap.plan_role_arn
+    apply_role_arn = module.bootstrap.apply_role_arn
+  }
+}

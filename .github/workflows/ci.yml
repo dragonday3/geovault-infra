@@ -1,5 +1,7 @@
 # CI: static checks, then the whole stack applied to the MiniStack emulator and verified.
-# No AWS credentials exist in this workflow: nothing in it can touch a real account.
+# The real-AWS jobs (plan-aws, apply-aws) are skipped until the repository variables
+# AWS_ACCOUNT_ID, AWS_PLAN_ROLE_ARN and AWS_APPLY_ROLE_ARN exist (milestone C4). They use
+# GitHub OIDC: short-lived credentials, no stored AWS keys anywhere.
 # Third-party actions are pinned to full commit SHAs; images are pinned by digest in compose.yml.
 name: CI
 
@@ -7,13 +9,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:  # manual deploy: plan-for-apply, then apply-aws after reviewer approval
 
 permissions:
   contents: read
 
+# A new push cancels an older run of the same kind, but a manual (apply) run has its own group,
+# so merging something can never cancel a running terraform apply.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   GITLEAKS_IMAGE: zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f  # v8.30.1
@@ -27,9 +32,9 @@ jobs:
           persist-credentials: false
       - name: terraform fmt
         run: docker compose run --rm --no-deps terraform fmt -recursive -check -diff
-      - name: terraform validate (local and aws)
+      - name: terraform validate (every root)
         run: |
-          for env in local aws; do
+          for env in local aws aws-bootstrap; do
             docker compose run --rm tf-init -chdir=envs/$env init -backend=false -input=false
             docker compose run --rm --no-deps terraform -chdir=envs/$env validate
           done
@@ -64,3 +69,105 @@ jobs:
       - name: terraform destroy
         if: always()
         run: docker compose run --rm terraform -chdir=envs/local destroy -auto-approve -input=false
+
+  plan-aws:
+    # main only: pull requests never receive AWS credentials (they run on the emulator above).
+    if: vars.AWS_PLAN_ROLE_ARN != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: emulator
+    runs-on: ubuntu-24.04
+    concurrency: {group: aws-state, cancel-in-progress: false}
+    permissions:
+      contents: read
+      id-token: write  # this job only: request the GitHub OIDC token
+    env:
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          role-session-name: gh-plan-${{ github.run_id }}
+          aws-region: ap-south-1
+      - name: terraform plan (read-only role)
+        run: |
+          docker compose run --rm terraform-aws -chdir=envs/aws init -input=false \
+            -backend-config="bucket=geovault-tfstate-${TF_VAR_aws_account_id}" \
+            -backend-config="key=prod/terraform.tfstate"
+          docker compose run --rm terraform-aws -chdir=envs/aws plan -input=false -lock-timeout=60s
+
+  # Manual deploy, two steps:
+  #   1. plan-for-apply (read-only role) publishes the plan to the run summary, plus a hash of
+  #      its resource changes;
+  #   2. apply-aws waits in the "production" environment for a reviewer who has read that plan,
+  #      re-plans with the apply role and refuses to apply unless the changes hash is identical.
+  # (The plan file itself is not uploaded: it contains secret values and this repo is public.)
+  plan-for-apply:
+    if: vars.AWS_APPLY_ROLE_ARN != '' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: emulator
+    runs-on: ubuntu-24.04
+    concurrency: {group: aws-state, cancel-in-progress: false}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      changes_sha: ${{ steps.plan.outputs.changes_sha }}
+    env:
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          role-session-name: gh-plan-for-apply-${{ github.run_id }}
+          aws-region: ap-south-1
+      - name: terraform plan, publish for review
+        id: plan
+        run: |
+          tf() { docker compose run --rm -T terraform-aws -chdir=envs/aws "$@"; }
+          tf init -input=false -backend-config="bucket=geovault-tfstate-${TF_VAR_aws_account_id}" \
+            -backend-config="key=prod/terraform.tfstate"
+          tf plan -input=false -lock-timeout=60s -out=review.tfplan
+          { echo '## Plan to approve'; echo '```'; tf show -no-color review.tfplan; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          sha=$(tf show -json review.tfplan | jq -S -c '[.resource_changes[]? | {address, actions: .change.actions, before: .change.before, after: .change.after}]' | sha256sum | cut -d' ' -f1)
+          echo "changes_sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Changes hash: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+  apply-aws:
+    needs: plan-for-apply
+    runs-on: ubuntu-24.04
+    environment: production  # required reviewer approves after reading plan-for-apply's summary
+    concurrency: {group: aws-state, cancel-in-progress: false}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_aws_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+      REVIEWED_SHA: ${{ needs.plan-for-apply.outputs.changes_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          role-session-name: gh-apply-${{ github.run_id }}
+          aws-region: ap-south-1
+      - name: re-plan, compare with the reviewed plan, apply
+        run: |
+          tf() { docker compose run --rm -T terraform-aws -chdir=envs/aws "$@"; }
+          tf init -input=false -backend-config="bucket=geovault-tfstate-${TF_VAR_aws_account_id}" \
+            -backend-config="key=prod/terraform.tfstate"
+          tf plan -input=false -lock-timeout=60s -out=apply.tfplan
+          sha=$(tf show -json apply.tfplan | jq -S -c '[.resource_changes[]? | {address, actions: .change.actions, before: .change.before, after: .change.after}]' | sha256sum | cut -d' ' -f1)
+          if [ -z "$REVIEWED_SHA" ] || [ "$sha" != "$REVIEWED_SHA" ]; then
+            echo "::error::Plan changed since review ($sha vs $REVIEWED_SHA). Nothing applied; run the workflow again."
+            exit 1
+          fi
+          tf apply -input=false -lock-timeout=60s apply.tfplan
